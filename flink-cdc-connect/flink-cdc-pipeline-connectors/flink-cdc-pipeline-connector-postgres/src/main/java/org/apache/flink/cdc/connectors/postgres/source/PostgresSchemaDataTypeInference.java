@@ -20,8 +20,10 @@ package org.apache.flink.cdc.connectors.postgres.source;
 import org.apache.flink.cdc.common.annotation.Internal;
 import org.apache.flink.cdc.common.types.DataType;
 import org.apache.flink.cdc.common.types.DataTypes;
+import org.apache.flink.cdc.common.types.DecimalType;
 import org.apache.flink.cdc.debezium.event.DebeziumSchemaDataTypeInference;
 
+import io.debezium.data.VariableScaleDecimal;
 import io.debezium.data.geometry.Geography;
 import io.debezium.data.geometry.Geometry;
 import io.debezium.data.geometry.Point;
@@ -33,6 +35,7 @@ public class PostgresSchemaDataTypeInference extends DebeziumSchemaDataTypeInfer
 
     private static final long serialVersionUID = 1L;
 
+    @Override
     protected DataType inferStruct(Object value, Schema schema) {
         // the Geometry datatype in PostgresSQL will be converted to
         // a String with Json format
@@ -40,6 +43,16 @@ public class PostgresSchemaDataTypeInference extends DebeziumSchemaDataTypeInfer
                 || Geography.LOGICAL_NAME.equals(schema.name())
                 || Geometry.LOGICAL_NAME.equals(schema.name())) {
             return DataTypes.STRING();
+        } else if (VariableScaleDecimal.LOGICAL_NAME.equals(schema.name())) {
+            // NUMERIC / DECIMAL columns declared without precision and scale are
+            // emitted by Debezium (decimal.handling.mode=precise) as a
+            // VariableScaleDecimal struct. PostgresTypeUtils declares such columns
+            // as DECIMAL(38, 0) in the table schema, while the default inference
+            // derives a per-value precision and scale. The two layouts of
+            // BinaryRecordData differ (compact long vs. variable-length bytes), so
+            // records would be written with a different layout than readers of the
+            // declared schema expect. Pin the inferred type to the declared one.
+            return DataTypes.DECIMAL(DecimalType.MAX_PRECISION, DecimalType.DEFAULT_SCALE);
         } else {
             return super.inferStruct(value, schema);
         }

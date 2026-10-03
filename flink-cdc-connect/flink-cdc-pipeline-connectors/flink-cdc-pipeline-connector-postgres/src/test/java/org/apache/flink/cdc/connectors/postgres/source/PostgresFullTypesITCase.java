@@ -31,6 +31,8 @@ import org.apache.flink.cdc.common.data.binary.BinaryStringData;
 import org.apache.flink.cdc.common.event.CreateTableEvent;
 import org.apache.flink.cdc.common.event.DataChangeEvent;
 import org.apache.flink.cdc.common.event.Event;
+import org.apache.flink.cdc.common.schema.Column;
+import org.apache.flink.cdc.common.schema.Schema;
 import org.apache.flink.cdc.common.source.FlinkSourceProvider;
 import org.apache.flink.cdc.common.types.DataType;
 import org.apache.flink.cdc.common.types.DataTypes;
@@ -206,7 +208,10 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                             LocalDateTime.parse("2020-07-17T18:00:22.123456")),
                     DateData.fromEpochDay(18460),
                     TimeData.fromMillisOfDay(64822000),
-                    DecimalData.fromBigDecimal(new BigDecimal("500"), 10, 0),
+                    DecimalData.fromBigDecimal(
+                            new BigDecimal("500"),
+                            DecimalType.MAX_PRECISION,
+                            DecimalType.DEFAULT_SCALE),
                     BinaryStringData.fromString(
                             "{\"coordinates\":\"[[174.9479,-36.7208]]\",\"type\":\"Point\",\"srid\":3187}"),
                     BinaryStringData.fromString(
@@ -454,13 +459,16 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                                 new EventTypeInfo())
                         .executeAndCollect();
 
+        // NUMERIC / DECIMAL without precision and scale are declared as DECIMAL(38, 0), so the
+        // fractional part of 987.65 and 12.3 is rounded away (HALF_UP), consistently with the
+        // documented type mapping of the connector.
         Object[] expectedSnapshot =
                 new Object[] {
                     1,
                     DecimalData.fromBigDecimal(new BigDecimal("123.45"), 10, 2),
                     DecimalData.fromBigDecimal(new BigDecimal("67.8912"), 8, 4),
-                    DecimalData.fromBigDecimal(new BigDecimal("987.65"), 5, 2),
-                    DecimalData.fromBigDecimal(new BigDecimal("12.3"), 3, 1),
+                    DecimalData.fromBigDecimal(new BigDecimal("988"), 38, 0),
+                    DecimalData.fromBigDecimal(new BigDecimal("12"), 38, 0),
                     DecimalData.fromBigDecimal(new BigDecimal("100.50"), 38, 2),
                 };
 
@@ -469,6 +477,82 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
 
         Assertions.assertThat(recordFields(snapshotRecord, TYPES_WITH_PRECISE))
                 .isEqualTo(expectedSnapshot);
+    }
+
+    @Test
+    public void testUnconstrainedNumericWithDeclaredSchema() throws Exception {
+        initializePostgresTable(POSTGIS_CONTAINER, "decimal_mode_test");
+
+        PostgresSourceConfigFactory configFactory =
+                (PostgresSourceConfigFactory)
+                        new PostgresSourceConfigFactory()
+                                .hostname(POSTGIS_CONTAINER.getHost())
+                                .port(POSTGIS_CONTAINER.getMappedPort(POSTGRESQL_PORT))
+                                .username(TEST_USER)
+                                .password(TEST_PASSWORD)
+                                .databaseList(POSTGRES_CONTAINER.getDatabaseName())
+                                .tableList("test_decimal.decimal_test_unconstrained")
+                                .startupOptions(StartupOptions.initial())
+                                .serverTimeZone("UTC");
+        configFactory.database(POSTGRES_CONTAINER.getDatabaseName());
+        configFactory.slotName(slotName);
+        configFactory.decodingPluginName("pgoutput");
+
+        FlinkSourceProvider sourceProvider =
+                (FlinkSourceProvider)
+                        new PostgresDataSource(configFactory).getEventSourceProvider();
+
+        CloseableIterator<Event> events =
+                env.fromSource(
+                                sourceProvider.getSource(),
+                                WatermarkStrategy.noWatermarks(),
+                                PostgresDataSourceFactory.IDENTIFIER,
+                                new EventTypeInfo())
+                        .executeAndCollect();
+
+        DataType declaredType =
+                DataTypes.DECIMAL(DecimalType.MAX_PRECISION, DecimalType.DEFAULT_SCALE);
+        Map<Integer, DecimalData> expectedValues = new HashMap<>();
+        expectedValues.put(1, null);
+        expectedValues.put(2, DecimalData.fromBigDecimal(BigDecimal.ZERO, 38, 0));
+        expectedValues.put(3, DecimalData.fromBigDecimal(new BigDecimal("123"), 38, 0));
+        expectedValues.put(
+                4,
+                DecimalData.fromBigDecimal(new BigDecimal("12345678901234567890123456789"), 38, 0));
+        expectedValues.put(5, DecimalData.fromBigDecimal(new BigDecimal("-42"), 38, 0));
+
+        // Snapshot phase. Records are read with the schema declared by the CreateTableEvent, as
+        // downstream operators do, instead of a hand-written row type.
+        Tuple2<List<Event>, List<CreateTableEvent>> snapshot =
+                fetchResultsAndCreateTableEvent(events, expectedValues.size());
+        Assertions.assertThat(snapshot.f1).isNotEmpty();
+        Schema declaredSchema = snapshot.f1.get(0).getSchema();
+        Assertions.assertThat(declaredSchema.getColumn("unconstrained_numeric"))
+                .isPresent()
+                .get()
+                .extracting(Column::getType)
+                .isEqualTo(declaredType);
+        RowType declaredRowType = (RowType) declaredSchema.toRowDataType();
+
+        Assertions.assertThat(unconstrainedNumericById(snapshot.f0, declaredRowType))
+                .isEqualTo(expectedValues);
+
+        // Streaming phase with the same set of values.
+        try (Connection connection =
+                        PostgresTestBase.getJdbcConnection(POSTGIS_CONTAINER, "postgres");
+                Statement statement = connection.createStatement()) {
+            statement.execute(
+                    "INSERT INTO test_decimal.decimal_test_unconstrained (id, unconstrained_numeric) VALUES "
+                            + "(11, null), (12, 0), (13, 123), (14, 12345678901234567890123456789), (15, -42)");
+        }
+
+        Map<Integer, DecimalData> expectedStreamingValues = new HashMap<>();
+        expectedValues.forEach((id, value) -> expectedStreamingValues.put(id + 10, value));
+
+        List<Event> streamingResults =
+                fetchResultsAndCreateTableEvent(events, expectedStreamingValues.size()).f0;
+        Assertions.assertThat(unconstrainedNumericById(streamingResults, declaredRowType))
+                .isEqualTo(expectedStreamingValues);
     }
 
     @Test
@@ -1105,6 +1189,16 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
         return Tuple2.of(result, createTableEvents);
     }
 
+    private Map<Integer, DecimalData> unconstrainedNumericById(
+            List<Event> events, RowType rowType) {
+        Map<Integer, DecimalData> result = new HashMap<>();
+        for (Event event : events) {
+            Object[] fields = recordFields(((DataChangeEvent) event).after(), rowType);
+            result.put((Integer) fields[0], (DecimalData) fields[1]);
+        }
+        return result;
+    }
+
     private Object[] recordFields(RecordData record, RowType rowType) {
         int fieldNum = record.getArity();
         List<DataType> fieldTypes = rowType.getChildren();
@@ -1146,7 +1240,8 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                     DataTypes.TIMESTAMP(6),
                     DataTypes.DATE(),
                     DataTypes.TIME(0),
-                    DataTypes.DECIMAL(DecimalType.DEFAULT_PRECISION, DecimalType.DEFAULT_SCALE),
+                    // unconstrained NUMERIC is declared as DECIMAL(38, 0)
+                    DataTypes.DECIMAL(DecimalType.MAX_PRECISION, DecimalType.DEFAULT_SCALE),
                     DataTypes.STRING(),
                     DataTypes.STRING(),
                     DataTypes.BOOLEAN(),
@@ -1176,8 +1271,8 @@ public class PostgresFullTypesITCase extends PostgresTestBase {
                     DataTypes.INT(),
                     DataTypes.DECIMAL(10, 2),
                     DataTypes.DECIMAL(8, 4),
-                    DataTypes.DECIMAL(5, 2),
-                    DataTypes.DECIMAL(3, 1),
+                    DataTypes.DECIMAL(38, 0),
+                    DataTypes.DECIMAL(38, 0),
                     DataTypes.DECIMAL(38, 2));
 
     private static final RowType TYPES_WITH_DOUBLE =

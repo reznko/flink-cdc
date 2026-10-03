@@ -68,3 +68,24 @@ INSERT INTO decimal_test_zero (
     amount_money
 ) VALUES
     (2, 99999999.99, 9999.9999, null, null, null);
+
+
+-- NUMERIC without precision and scale is declared as DECIMAL(38, 0) in the table schema while
+-- Debezium emits it as a VariableScaleDecimal struct, see FLINK-38196.
+DROP TABLE IF EXISTS decimal_test_unconstrained;
+CREATE TABLE decimal_test_unconstrained (
+                                    id SERIAL PRIMARY KEY,
+                                    unconstrained_numeric NUMERIC
+);
+
+ALTER TABLE decimal_test_unconstrained REPLICA IDENTITY FULL;
+
+INSERT INTO decimal_test_unconstrained (
+    id,
+    unconstrained_numeric
+) VALUES
+    (1, null),
+    (2, 0),
+    (3, 123),
+    (4, 12345678901234567890123456789),
+    (5, -42);
